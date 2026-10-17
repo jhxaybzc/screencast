@@ -58,8 +58,8 @@
 // order and plays them, always jumping to the newest moment.
 const RELAY = 'https://ppng.io/';
 const PREFIX = 'jh-screencast-';
-const LANES = 8;
-const PIECE_MS = 250;
+const LANES = 4; // browsers allow only 6 open requests per site on older connections; stay under it
+const PIECE_MS = 400;
 const MIME = ['video/webm;codecs=vp8', 'video/webm;codecs=vp9', 'video/webm']
   .find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || 'video/webm;codecs=vp8';
 const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
@@ -203,6 +203,7 @@ async function startSession() {
   s.session = session; s.seq = 0;
   s.lanes = Array.from({ length: LANES }, () => []);
   wakeAll();
+  s.waiting = true;
   status('Waiting for the ViewSonic...');
 
   // Wait here until the ViewSonic is listening
@@ -214,6 +215,7 @@ async function startSession() {
     await sleep(1000);
   }
   if (!s.sharing || s.session !== session) return;
+  s.waiting = false;
 
   const rec = new MediaRecorder(s.stream, { mimeType: MIME, videoBitsPerSecond: 2000000 });
   rec.ondataavailable = e => {
@@ -222,7 +224,7 @@ async function startSession() {
     const head = session + String(seq).padStart(8, '0');
     s.lanes[seq % LANES].push(new Blob([head, e.data]));
     const w = s.wake[seq % LANES]; if (w) w();
-    if (backlog() > 16) startSession(); // falling behind (over ~4 s): start fresh so it stays live
+    if (backlog() > 10) startSession(); // falling behind (over ~4 s): start fresh so it stays live
   };
   s.recorder = rec;
   rec.start(PIECE_MS);
@@ -273,7 +275,8 @@ async function startShare() {
   let prev = 0;
   s.statsTimer = setInterval(() => {
     const kbps = Math.round((s.sentBytes - prev) * 8 / 2000); prev = s.sentBytes;
-    if (s.sentBytes) status('Sharing to ' + code + ' (' + kbps + ' kbps, delay about ' + (0.5 + backlog() * PIECE_MS / 1000).toFixed(1) + ' s)');
+    if (s.waiting) status('Waiting for the ViewSonic...');
+    else status('Sharing to ' + code + ' (' + kbps + ' kbps, delay about ' + (0.5 + backlog() * PIECE_MS / 1000).toFixed(1) + ' s)');
   }, 2000);
 
   $('startShare').classList.add('hidden');
