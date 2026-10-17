@@ -60,13 +60,26 @@
 const PREFIX = 'jh-screencast-';
 const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O/1/I/L
 const $ = id => document.getElementById(id);
-// Servers that help each device find its public address.
-// If it still fails, paste TURN server details (from a free account at metered.ca or Cloudflare) into the commented entry.
-const PEER_OPTS = { debug: 2, config: { iceServers: [
+// ===== PASTE YOUR METERED TURN LINK HERE =====
+// Free account at metered.ca -> TURN Server -> copy the "credentials API" URL (ends in ?apiKey=...)
+const TURN_API_URL = '';
+// =============================================
+
+const STUN = [
   { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
   { urls: 'stun:stun.cloudflare.com:3478' },
-  // { urls: 'turn:YOUR_TURN_HOST:443?transport=tcp', username: 'USER', credential: 'PASS' },
-]}};
+];
+let peerOpts;
+async function getPeerOpts() {
+  if (peerOpts) return peerOpts;
+  let servers = STUN;
+  if (TURN_API_URL) {
+    try { servers = STUN.concat(await (await fetch(TURN_API_URL)).json()); }
+    catch (e) { console.warn('TURN fetch failed', e); }
+  }
+  peerOpts = { debug: 2, config: { iceServers: servers } };
+  return peerOpts;
+}
 if (typeof Peer === 'undefined') alert('peerjs.min.js did not load. Make sure it is in the same folder as index.html.');
 const show = id => ['home','waiting','viewer','share'].forEach(x => $(x).classList.toggle('hidden', x !== id));
 
@@ -78,10 +91,10 @@ function makeCode() {
 
 // ---------- Receiver (ViewSonic) ----------
 let viewPeer;
-function startViewer() {
+async function startViewer() {
   show('waiting');
   const code = makeCode();
-  viewPeer = new Peer(PREFIX + code, PEER_OPTS);
+  viewPeer = new Peer(PREFIX + code, await getPeerOpts());
 
   viewPeer.on('open', () => {
     $('codeOut').textContent = code;
@@ -90,18 +103,20 @@ function startViewer() {
 
   viewPeer.on('call', call => {
     call.answer(); // receive only
+    $('viewStatus').textContent = 'Screen found, connecting...';
     call.on('stream', stream => {
       $('video').srcObject = stream;
       $('video').play().catch(() => {});
-      show('viewer');
     });
-    const backToCode = () => { $('video').srcObject = null; show('waiting'); $('viewStatus').textContent = 'Waiting for a screen...'; };
-    call.on('close', backToCode);
-    call.on('error', backToCode);
-    // Catch drops that PeerJS doesn't report as "close"
+    const backToCode = msg => { $('video').srcObject = null; show('waiting'); $('viewStatus').textContent = msg || 'Waiting for a screen...'; };
+    call.on('close', () => backToCode());
+    call.on('error', () => backToCode());
     const pc = call.peerConnection;
     pc.addEventListener('connectionstatechange', () => {
-      if (['disconnected','failed','closed'].includes(pc.connectionState)) backToCode();
+      const s = pc.connectionState;
+      if (s === 'connected') show('viewer'); // only switch once video can actually flow
+      if (s === 'failed') backToCode('Could not connect. The network blocks direct video; add a TURN link.');
+      if (s === 'disconnected' || s === 'closed') backToCode();
     });
   });
 
@@ -138,11 +153,11 @@ async function startShare() {
   const timer = setTimeout(() => {
     status(stage === 1
       ? 'Stuck at step 1: this network blocks the matchmaking server (0.peerjs.com).'
-      : 'Stuck at step ' + stage + ': the devices found each other but the network blocks the direct video link. A TURN server is needed (see PEER_OPTS in the code).');
+      : 'Stuck at step ' + stage + ': the devices found each other but the network blocks the direct video link. Add a TURN link (TURN_API_URL at the top of the code).');
     stopShare(true);
   }, 20000);
 
-  sendPeer = new Peer(PEER_OPTS);
+  sendPeer = new Peer(await getPeerOpts());
   sendPeer.on('open', () => {
     stage = 2;
     status('Step 2/3: calling the ViewSonic...');
