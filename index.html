@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Screen Cast</title>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+  :root { --bg:#0f1115; --card:#1a1d24; --text:#e8e8ea; --muted:#9aa0aa; --accent:#3b82f6; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:system-ui, sans-serif; min-height:100vh; }
+  .wrap { max-width:520px; margin:0 auto; padding:48px 16px; text-align:center; }
+  h1 { font-size:28px; margin:0 0 8px; }
+  p { color:var(--muted); }
+  button { background:var(--accent); color:#fff; border:0; border-radius:10px; padding:16px 20px; font-size:18px; width:100%; margin:8px 0; cursor:pointer; }
+  button.secondary { background:var(--card); }
+  input { width:100%; font-size:32px; text-align:center; letter-spacing:8px; text-transform:uppercase; padding:12px; border-radius:10px; border:1px solid #333; background:var(--card); color:var(--text); }
+  .code { font-size:120px; font-weight:700; letter-spacing:16px; margin:24px 0; font-family:ui-monospace, monospace; }
+  .status { margin-top:16px; color:var(--muted); min-height:1.5em; }
+  .hidden { display:none !important; }
+  #viewer { position:fixed; inset:0; background:#000; }
+  #video { width:100%; height:100%; object-fit:contain; background:#000; }
+  #fsHint { position:fixed; bottom:12px; right:12px; color:#666; font-size:14px; }
+</style>
+</head>
+<body>
+
+<!-- Home -->
+<div id="home" class="wrap">
+  <h1>Screen Cast</h1>
+  <p>Open this page on both devices.</p>
+  <button id="goView">Show a screen here (ViewSonic)</button>
+  <button id="goShare" class="secondary">Share my screen (Surface)</button>
+</div>
+
+<!-- Receiver waiting -->
+<div id="waiting" class="wrap hidden">
+  <h1>Enter this code on the Surface</h1>
+  <div class="code" id="codeOut">------</div>
+  <div class="status" id="viewStatus">Connecting...</div>
+</div>
+
+<!-- Receiver video -->
+<div id="viewer" class="hidden">
+  <video id="video" autoplay playsinline muted></video>
+  <div id="fsHint">Tap for fullscreen</div>
+</div>
+
+<!-- Sender -->
+<div id="share" class="wrap hidden">
+  <h1>Share your screen</h1>
+  <p>Type the code shown on the ViewSonic.</p>
+  <input id="codeIn" maxlength="6" autocomplete="off">
+  <button id="startShare">Start sharing</button>
+  <button id="stopShare" class="secondary hidden">Stop sharing</button>
+  <div class="status" id="shareStatus"></div>
+</div>
+
+<script>
+const PREFIX = 'jh-screencast-';
+const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O/1/I/L
+const $ = id => document.getElementById(id);
+const show = id => ['home','waiting','viewer','share'].forEach(x => $(x).classList.toggle('hidden', x !== id));
+
+function makeCode() {
+  let c = '';
+  for (let i = 0; i < 6; i++) c += ALPHABET[Math.floor(Math.random() * ALPHABET.length)];
+  return c;
+}
+
+// ---------- Receiver (ViewSonic) ----------
+let viewPeer;
+function startViewer() {
+  show('waiting');
+  const code = makeCode();
+  viewPeer = new Peer(PREFIX + code);
+
+  viewPeer.on('open', () => {
+    $('codeOut').textContent = code;
+    $('viewStatus').textContent = 'Waiting for a screen...';
+  });
+
+  viewPeer.on('call', call => {
+    call.answer(); // receive only
+    call.on('stream', stream => {
+      $('video').srcObject = stream;
+      $('video').play().catch(() => {});
+      show('viewer');
+    });
+    const backToCode = () => { $('video').srcObject = null; show('waiting'); $('viewStatus').textContent = 'Waiting for a screen...'; };
+    call.on('close', backToCode);
+    call.on('error', backToCode);
+    // Catch drops that PeerJS doesn't report as "close"
+    const pc = call.peerConnection;
+    pc.addEventListener('connectionstatechange', () => {
+      if (['disconnected','failed','closed'].includes(pc.connectionState)) backToCode();
+    });
+  });
+
+  viewPeer.on('disconnected', () => viewPeer.reconnect());
+  viewPeer.on('error', err => {
+    if (err.type === 'unavailable-id') { viewPeer.destroy(); startViewer(); return; } // code taken, pick another
+    $('viewStatus').textContent = 'Error: ' + err.type + '. Reload the page.';
+  });
+}
+
+// Tap video to go fullscreen
+$('viewer').addEventListener('click', () => {
+  if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(() => {});
+  else document.exitFullscreen();
+});
+document.addEventListener('fullscreenchange', () => $('fsHint').classList.toggle('hidden', !!document.fullscreenElement));
+
+// ---------- Sender (Surface) ----------
+let sendPeer, stream, call;
+async function startShare() {
+  const code = $('codeIn').value.trim().toUpperCase();
+  if (code.length !== 6) { $('shareStatus').textContent = 'Code must be 6 characters.'; return; }
+
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: true });
+  } catch (e) {
+    $('shareStatus').textContent = 'Screen share was cancelled.';
+    return;
+  }
+
+  $('shareStatus').textContent = 'Connecting...';
+  sendPeer = new Peer();
+  sendPeer.on('open', () => {
+    call = sendPeer.call(PREFIX + code, stream);
+    if (!call) { $('shareStatus').textContent = 'Could not reach that screen.'; stopShare(); return; }
+    call.peerConnection.addEventListener('connectionstatechange', () => {
+      const s = call.peerConnection.connectionState;
+      if (s === 'connected') $('shareStatus').textContent = 'Sharing to ' + code;
+      if (s === 'failed') { $('shareStatus').textContent = 'Connection failed. Are both on the same Wi-Fi?'; stopShare(); }
+    });
+    call.on('close', () => stopShare());
+  });
+  sendPeer.on('error', err => {
+    $('shareStatus').textContent = err.type === 'peer-unavailable' ? 'No screen found with that code.' : 'Error: ' + err.type;
+    stopShare();
+  });
+
+  // User clicked the browser's own "Stop sharing" bar
+  stream.getVideoTracks()[0].addEventListener('ended', stopShare);
+
+  $('startShare').classList.add('hidden');
+  $('stopShare').classList.remove('hidden');
+}
+
+function stopShare() {
+  if (call) { call.close(); call = null; }
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  if (sendPeer) { sendPeer.destroy(); sendPeer = null; }
+  $('startShare').classList.remove('hidden');
+  $('stopShare').classList.add('hidden');
+  if ($('shareStatus').textContent.startsWith('Sharing')) $('shareStatus').textContent = 'Stopped.';
+}
+
+// ---------- Wiring ----------
+$('goView').onclick = () => { location.hash = 'view'; startViewer(); };
+$('goShare').onclick = () => { location.hash = 'share'; show('share'); $('codeIn').focus(); };
+$('startShare').onclick = startShare;
+$('stopShare').onclick = stopShare;
+$('codeIn').addEventListener('keydown', e => { if (e.key === 'Enter') startShare(); });
+
+// Bookmarkable: page.html#view on the ViewSonic, page.html#share on the Surface
+if (location.hash === '#view') startViewer();
+else if (location.hash === '#share') show('share');
+</script>
+</body>
+</html>
