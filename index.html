@@ -60,23 +60,22 @@
 const PREFIX = 'jh-screencast-';
 const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O/1/I/L
 const $ = id => document.getElementById(id);
-// ===== PASTE YOUR METERED TURN LINK HERE =====
-// Free account at metered.ca -> TURN Server -> copy the "credentials API" URL (ends in ?apiKey=...)
-const TURN_API_URL = '';
-// =============================================
-
-const STUN = [
-  { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
-  { urls: 'stun:stun.cloudflare.com:3478' },
+// Address finders (STUN) plus free, no-signup relays (TURN) that carry the video
+// when the network won't let the devices connect directly.
+const ICE = [
+  { urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] },
+  { urls: ['turn:freestun.net:3478?transport=udp', 'turn:freestun.net:3478?transport=tcp'], username: 'free', credential: 'free' },
 ];
 let peerOpts;
 async function getPeerOpts() {
   if (peerOpts) return peerOpts;
-  let servers = STUN;
-  if (TURN_API_URL) {
-    try { servers = STUN.concat(await (await fetch(TURN_API_URL)).json()); }
-    catch (e) { console.warn('TURN fetch failed', e); }
-  }
+  let servers = ICE.slice();
+  // Bonus relay: Cloudflare's speed-test TURN logins. Skipped silently if the browser blocks it.
+  try {
+    const ctrl = new AbortController(); setTimeout(() => ctrl.abort(), 3000);
+    const cf = await (await fetch('https://speed.cloudflare.com/turn-creds', { signal: ctrl.signal })).json();
+    if (cf && cf.urls) servers.push({ urls: cf.urls, username: cf.username, credential: cf.credential });
+  } catch (e) {}
   peerOpts = { debug: 2, config: { iceServers: servers } };
   return peerOpts;
 }
@@ -115,7 +114,7 @@ async function startViewer() {
     pc.addEventListener('connectionstatechange', () => {
       const s = pc.connectionState;
       if (s === 'connected') show('viewer'); // only switch once video can actually flow
-      if (s === 'failed') backToCode('Could not connect. The network blocks direct video; add a TURN link.');
+      if (s === 'failed') backToCode('Could not connect. The network blocks direct video; the free relay may be blocked too.');
       if (s === 'disconnected' || s === 'closed') backToCode();
     });
   });
@@ -153,7 +152,7 @@ async function startShare() {
   const timer = setTimeout(() => {
     status(stage === 1
       ? 'Stuck at step 1: this network blocks the matchmaking server (0.peerjs.com).'
-      : 'Stuck at step ' + stage + ': the devices found each other but the network blocks the direct video link. Add a TURN link (TURN_API_URL at the top of the code).');
+      : 'Stuck at step ' + stage + ': the devices found each other but the network blocks the direct video link. The free relay may be down or blocked too.');
     stopShare(true);
   }, 20000);
 
