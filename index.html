@@ -18,7 +18,7 @@
   .status { margin-top:16px; color:var(--muted); min-height:1.5em; }
   .hidden { display:none !important; }
   #viewer { position:fixed; inset:0; background:#000; }
-  #live { width:100%; height:100%; object-fit:contain; display:block; background:#000; }
+  #viewer video { width:100%; height:100%; object-fit:contain; display:block; background:#000; }
   #fsHint { position:fixed; bottom:12px; right:12px; color:#666; font-size:14px; }
 </style>
 </head>
@@ -38,7 +38,8 @@
 </div>
 
 <div id="viewer" class="hidden">
-  <video id="live" autoplay muted playsinline></video>
+  <video id="direct" autoplay muted playsinline></video>
+  <video id="live" autoplay muted playsinline class="hidden"></video>
   <div id="fsHint">Tap for fullscreen</div>
 </div>
 
@@ -55,11 +56,17 @@
 // Your Cloudflare Worker (the /cast route)
 const RELAY = 'https://proctor-worker.jhxaybzc.workers.dev';
 
-// How it works: the Surface records its screen as compressed video and sends it in
-// fifth-of-a-second pieces over one WebSocket to your Cloudflare Worker, which passes
-// them straight to the ViewSonic. Everything runs over normal HTTPS (port 443).
-const relayBase = (new URLSearchParams(location.search).get('relay') || RELAY).replace(/\/$/, '').replace(/^http/, 'ws');
+// How it works:
+// 1. Direct (normal): the worker only introduces the two devices, then video goes straight
+//    from the Surface to the ViewSonic, the same way your proctor portal works.
+// 2. Backup: if the direct link doesn't connect within 8 seconds, the Surface records
+//    compressed video and streams it through the worker instead.
+const params = new URLSearchParams(location.search);
+const relayBase = (params.get('relay') || RELAY).replace(/\/$/, '').replace(/^http/, 'ws');
 const wsUrl = (code, role) => relayBase + '/cast?room=' + code + '&role=' + role;
+const ICE = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+if (params.has('nodirect')) ICE.iceTransportPolicy = 'relay'; // testing only: forces the backup
+const DIRECT_TIMEOUT_MS = 8000;
 const PIECE_MS = 200;
 const MIME = ['video/webm;codecs=vp8', 'video/webm;codecs=vp9', 'video/webm']
   .find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || 'video/webm;codecs=vp8';
@@ -67,9 +74,11 @@ const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const $ = id => document.getElementById(id);
 const show = id => ['home','waiting','viewer','share'].forEach(x => $(x).classList.toggle('hidden', x !== id));
 const randomCode = () => Array.from({ length: 6 }, () => ALPHABET[Math.floor(Math.random() * ALPHABET.length)]).join('');
+const send = (ws, obj) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); };
 
 // =================== Receiver (ViewSonic) ===================
-const v = { code: null, ms: null, sb: null, queue: [], lastData: 0, ready: false };
+const v = { code: null, ws: null, pc: null, chain: Promise.resolve(), mode: null,
+            ms: null, sb: null, queue: [], relayReady: false, lastData: 0 };
 
 function startViewer() {
   v.code = randomCode();
@@ -77,44 +86,79 @@ function startViewer() {
   show('waiting');
   connectViewer();
   setInterval(() => {
-    if (!$('viewer').classList.contains('hidden') && Date.now() - v.lastData > 6000) {
-      show('waiting');
-      $('viewStatus').textContent = 'Sharing stopped. Waiting for a screen...';
-    }
+    if (v.mode === 'relay' && Date.now() - v.lastData > 6000) backToCode('Sharing stopped. Waiting for a screen...');
   }, 2000);
+}
+
+function backToCode(msg) {
+  if (v.pc) { v.pc.close(); v.pc = null; }
+  v.mode = null; v.relayReady = false; v.queue = [];
+  $('direct').srcObject = null;
+  $('live').removeAttribute('src');
+  show('waiting');
+  $('viewStatus').textContent = msg || 'Waiting for a screen...';
+}
+
+function showVideo(which) {
+  v.mode = which;
+  $('direct').classList.toggle('hidden', which !== 'direct');
+  $('live').classList.toggle('hidden', which !== 'relay');
+  show('viewer');
 }
 
 function connectViewer() {
   const ws = new WebSocket(wsUrl(v.code, 'viewer'));
   ws.binaryType = 'arraybuffer';
+  v.ws = ws;
   ws.onopen = () => { $('viewStatus').textContent = 'Waiting for a screen...'; };
   ws.onmessage = e => {
-    if (typeof e.data === 'string') {
-      const m = JSON.parse(e.data);
-      if (m.t === 'start') resetPlayer(m.mime);
-      return;
-    }
-    if (!v.ready) return; // wait for the start of a recording
-    v.queue.push(e.data);
-    pump();
-    v.lastData = Date.now();
-    if ($('viewer').classList.contains('hidden')) show('viewer');
+    if (typeof e.data !== 'string') { onRelayPiece(e.data); return; }
+    const m = JSON.parse(e.data);
+    if (m.t === 'signal') v.chain = v.chain.then(() => viewerSignal(m.data)).catch(() => {});
+    else if (m.t === 'start') { if (v.mode !== 'direct') resetRelayPlayer(m.mime); }
+    else if (m.t === 'bye') backToCode('Sharing stopped. Waiting for a screen...');
   };
   ws.onclose = () => {
+    if (v.ws !== ws) return;
     $('viewStatus').textContent = 'Reconnecting...';
     setTimeout(connectViewer, 1500);
   };
 }
 
-function resetPlayer(mime) {
-  v.queue = []; v.sb = null; v.ready = false;
+// --- Direct ---
+async function viewerSignal(data) {
+  if (data.kind === 'offer') {
+    if (v.pc) v.pc.close();
+    const pc = new RTCPeerConnection(ICE);
+    v.pc = pc;
+    pc.onicecandidate = e => { if (e.candidate) send(v.ws, { t: 'signal', data: { kind: 'ice', payload: e.candidate.toJSON() } }); };
+    pc.ontrack = e => {
+      $('direct').srcObject = e.streams[0];
+      $('direct').play().catch(() => {});
+    };
+    pc.onconnectionstatechange = () => {
+      if (v.pc !== pc) return;
+      if (pc.connectionState === 'connected') showVideo('direct');
+      if (pc.connectionState === 'failed' && v.mode === 'direct') backToCode('Connection lost. Waiting for a screen...');
+    };
+    await pc.setRemoteDescription(data.payload);
+    await pc.setLocalDescription(await pc.createAnswer());
+    send(v.ws, { t: 'signal', data: { kind: 'answer', payload: pc.localDescription } });
+  } else if (data.kind === 'ice' && v.pc) {
+    await v.pc.addIceCandidate(data.payload);
+  }
+}
+
+// --- Backup (relay) ---
+function resetRelayPlayer(mime) {
+  v.queue = []; v.sb = null; v.relayReady = false;
   if (!window.MediaSource || !MediaSource.isTypeSupported(mime)) {
     $('viewStatus').textContent = 'This browser cannot play ' + mime;
     return;
   }
   const video = $('live');
   const ms = new MediaSource();
-  v.ms = ms; v.ready = true;
+  v.ms = ms; v.relayReady = true;
   video.src = URL.createObjectURL(ms);
   ms.addEventListener('sourceopen', () => {
     if (ms !== v.ms) return;
@@ -122,6 +166,14 @@ function resetPlayer(mime) {
     v.sb.addEventListener('updateend', onUpdateEnd);
     pump();
   }, { once: true });
+}
+
+function onRelayPiece(buf) {
+  if (!v.relayReady || v.mode === 'direct') return;
+  v.queue.push(buf);
+  pump();
+  v.lastData = Date.now();
+  if (v.mode !== 'relay') showVideo('relay');
 }
 
 function pump() {
@@ -150,8 +202,10 @@ $('viewer').addEventListener('click', () => {
 document.addEventListener('fullscreenchange', () => $('fsHint').classList.toggle('hidden', !!document.fullscreenElement));
 
 // =================== Sender (Surface) ===================
-const s = { code: null, stream: null, ws: null, rec: null, sharing: false, viewers: 0, sent: 0, timer: null };
+const s = { code: null, stream: null, ws: null, sharing: false, peers: {}, rec: null, sent: 0, timer: null };
 const status = t => $('shareStatus').textContent = t;
+const relayViewers = () => Object.values(s.peers).filter(p => p.mode === 'relay').length;
+const directViewers = () => Object.values(s.peers).filter(p => p.mode === 'direct').length;
 
 function connectSender() {
   const ws = new WebSocket(wsUrl(s.code, 'sender'));
@@ -159,13 +213,70 @@ function connectSender() {
   ws.onopen = () => status('Connected. Waiting for the ViewSonic...');
   ws.onmessage = e => {
     const m = JSON.parse(e.data);
-    if (m.t === 'restart') startRecording();
-    if (m.t === 'viewers') { s.viewers = m.n; if (!m.n) stopRecording(); }
+    if (m.t === 'viewer-joined') tryDirect(m.id);
+    else if (m.t === 'viewer-left') dropPeer(m.id);
+    else if (m.t === 'signal' && s.peers[m.from]) {
+      const p = s.peers[m.from];
+      p.chain = p.chain.then(() => senderSignal(p, m.data)).catch(() => {});
+    }
   };
   ws.onclose = () => {
     stopRecording();
+    Object.keys(s.peers).forEach(dropPeer);
     if (s.sharing && s.ws === ws) { status('Reconnecting...'); setTimeout(connectSender, 1500); }
   };
+}
+
+// Try the direct link to one viewer; fall back to the relay if it doesn't connect in time
+async function tryDirect(id) {
+  dropPeer(id);
+  const pc = new RTCPeerConnection(ICE);
+  const p = { id, pc, mode: 'trying', chain: Promise.resolve() };
+  s.peers[id] = p;
+  s.stream.getTracks().forEach(t => {
+    const sender = pc.addTrack(t, s.stream);
+    // Screens are mostly text: keep full sharpness and drop frames instead of resolution
+    const prm = sender.getParameters();
+    prm.degradationPreference = 'maintain-resolution';
+    if (prm.encodings && prm.encodings[0]) prm.encodings[0].maxBitrate = 4000000;
+    sender.setParameters(prm).catch(() => {});
+  });
+  pc.onicecandidate = e => { if (e.candidate) send(s.ws, { t: 'signal', to: id, data: { kind: 'ice', payload: e.candidate.toJSON() } }); };
+  pc.onconnectionstatechange = () => {
+    if (s.peers[id] !== p) return;
+    if (pc.connectionState === 'connected' && p.mode !== 'relay') { p.mode = 'direct'; clearTimeout(p.timer); updateRecording(); }
+    if (pc.connectionState === 'failed') useRelay(p);
+  };
+  p.timer = setTimeout(() => { if (p.mode === 'trying') useRelay(p); }, DIRECT_TIMEOUT_MS);
+  status('Connecting to the ViewSonic...');
+  await pc.setLocalDescription(await pc.createOffer());
+  send(s.ws, { t: 'signal', to: id, data: { kind: 'offer', payload: pc.localDescription } });
+}
+
+async function senderSignal(p, data) {
+  if (data.kind === 'answer') await p.pc.setRemoteDescription(data.payload);
+  if (data.kind === 'ice') await p.pc.addIceCandidate(data.payload);
+}
+
+function useRelay(p) {
+  if (p.mode === 'relay') return;
+  p.mode = 'relay';
+  clearTimeout(p.timer);
+  try { p.pc.close(); } catch (e) {}
+  startRecording(); // fresh recording so the viewer can start playing from the beginning
+}
+
+function dropPeer(id) {
+  const p = s.peers[id];
+  if (!p) return;
+  clearTimeout(p.timer);
+  try { p.pc.close(); } catch (e) {}
+  delete s.peers[id];
+  updateRecording();
+}
+
+function updateRecording() {
+  if (!relayViewers()) stopRecording();
 }
 
 function stopRecording() {
@@ -178,12 +289,12 @@ function stopRecording() {
 function startRecording() {
   stopRecording();
   const ws = s.ws;
-  if (!s.sharing || !ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({ t: 'start', mime: MIME }));
+  if (!s.sharing || !ws || ws.readyState !== 1) return;
+  send(ws, { t: 'start', mime: MIME });
   const rec = new MediaRecorder(s.stream, { mimeType: MIME, videoBitsPerSecond: 2500000 });
   rec.ondataavailable = e => {
-    if (!e.data.size || ws.readyState !== WebSocket.OPEN) return;
-    if (ws.bufferedAmount > 2000000) { startRecording(); return; } // network falling behind: start fresh to stay live
+    if (!e.data.size || ws.readyState !== 1) return;
+    if (ws.bufferedAmount > 2000000) { startRecording(); return; } // falling behind: start fresh to stay live
     ws.send(e.data);
     s.sent += e.data.size;
   };
@@ -194,11 +305,11 @@ function startRecording() {
 async function startShare() {
   const code = $('codeIn').value.trim().toUpperCase();
   if (code.length !== 6) { status('Code must be 6 characters.'); return; }
-  if (!window.MediaRecorder) { status('This browser cannot record the screen. Try Edge or Chrome.'); return; }
   try {
     s.stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: false });
   } catch (e) { status('Screen share was cancelled.'); return; }
   s.stream.getVideoTracks()[0].addEventListener('ended', stopShare);
+  s.stream.getVideoTracks()[0].contentHint = 'detail';
 
   s.code = code; s.sharing = true; s.sent = 0;
   status('Connecting...');
@@ -207,7 +318,9 @@ async function startShare() {
   let prev = 0;
   s.timer = setInterval(() => {
     const kbps = Math.round((s.sent - prev) * 8 / 2000); prev = s.sent;
-    if (s.rec) status('Sharing to ' + code + ' (' + kbps + ' kbps' + (s.ws.bufferedAmount > 300000 ? ', network is struggling' : '') + ')');
+    const d = directViewers(), r = relayViewers();
+    if (d && !r) status('Sharing to ' + code + ' (direct)');
+    else if (r) status('Sharing to ' + code + ' (backup route, ' + kbps + ' kbps' + (s.ws && s.ws.bufferedAmount > 300000 ? ', network is struggling' : '') + ')');
   }, 2000);
 
   $('startShare').classList.add('hidden');
@@ -217,6 +330,7 @@ async function startShare() {
 function stopShare() {
   s.sharing = false;
   stopRecording();
+  Object.keys(s.peers).forEach(dropPeer);
   if (s.ws) { const ws = s.ws; s.ws = null; ws.close(); }
   clearInterval(s.timer);
   if (s.stream) { s.stream.getTracks().forEach(t => t.stop()); s.stream = null; }
