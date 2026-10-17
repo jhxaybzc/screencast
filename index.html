@@ -4,7 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Screen Cast</title>
-<script src="peerjs.min.js"></script>
 <style>
   :root { --bg:#0f1115; --card:#1a1d24; --text:#e8e8ea; --muted:#9aa0aa; --accent:#3b82f6; }
   * { box-sizing:border-box; }
@@ -14,18 +13,18 @@
   p { color:var(--muted); }
   button { background:var(--accent); color:#fff; border:0; border-radius:10px; padding:16px 20px; font-size:18px; width:100%; margin:8px 0; cursor:pointer; }
   button.secondary { background:var(--card); }
-  input { width:100%; font-size:32px; text-align:center; letter-spacing:8px; text-transform:uppercase; padding:12px; border-radius:10px; border:1px solid #333; background:var(--card); color:var(--text); }
+  input, select { width:100%; font-size:32px; text-align:center; letter-spacing:8px; text-transform:uppercase; padding:12px; border-radius:10px; border:1px solid #333; background:var(--card); color:var(--text); }
+  select { font-size:16px; letter-spacing:0; text-transform:none; margin-top:8px; }
   .code { font-size:120px; font-weight:700; letter-spacing:16px; margin:24px 0; font-family:ui-monospace, monospace; }
   .status { margin-top:16px; color:var(--muted); min-height:1.5em; }
   .hidden { display:none !important; }
   #viewer { position:fixed; inset:0; background:#000; }
-  #video { width:100%; height:100%; object-fit:contain; background:#000; }
+  #frame { width:100%; height:100%; object-fit:contain; display:block; }
   #fsHint { position:fixed; bottom:12px; right:12px; color:#666; font-size:14px; }
 </style>
 </head>
 <body>
 
-<!-- Home -->
 <div id="home" class="wrap">
   <h1>Screen Cast</h1>
   <p>Open this page on both devices.</p>
@@ -33,54 +32,43 @@
   <button id="goShare" class="secondary">Share my screen (Surface)</button>
 </div>
 
-<!-- Receiver waiting -->
 <div id="waiting" class="wrap hidden">
   <h1>Enter this code on the Surface</h1>
   <div class="code" id="codeOut">------</div>
-  <div class="status" id="viewStatus">Connecting...</div>
+  <div class="status" id="viewStatus">Waiting for a screen...</div>
 </div>
 
-<!-- Receiver video -->
 <div id="viewer" class="hidden">
-  <video id="video" autoplay playsinline muted></video>
+  <img id="frame" alt="">
   <div id="fsHint">Tap for fullscreen</div>
 </div>
 
-<!-- Sender -->
 <div id="share" class="wrap hidden">
   <h1>Share your screen</h1>
   <p>Type the code shown on the ViewSonic.</p>
   <input id="codeIn" maxlength="6" autocomplete="off">
+  <select id="quality">
+    <option value="1280,0.6">Balanced (1280px)</option>
+    <option value="960,0.55">Smoother (960px)</option>
+    <option value="1920,0.7">Sharper (1920px)</option>
+  </select>
   <button id="startShare">Start sharing</button>
   <button id="stopShare" class="secondary hidden">Stop sharing</button>
   <div class="status" id="shareStatus"></div>
 </div>
 
 <script>
+// How it works: the Surface turns the screen into JPEG pictures and uploads them to
+// ppng.io (a free public relay, no account). The ViewSonic downloads them as they arrive.
+// Several "lanes" run at once so pictures keep flowing while others are in transit.
+const RELAY = 'https://ppng.io/';
 const PREFIX = 'jh-screencast-';
-const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O/1/I/L
+const LANES = 4;
+const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const $ = id => document.getElementById(id);
-// Address finders (STUN) plus free, no-signup relays (TURN) that carry the video
-// when the network won't let the devices connect directly.
-const ICE = [
-  { urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] },
-  { urls: ['turn:freestun.net:3478?transport=udp', 'turn:freestun.net:3478?transport=tcp'], username: 'free', credential: 'free' },
-];
-let peerOpts;
-async function getPeerOpts() {
-  if (peerOpts) return peerOpts;
-  let servers = ICE.slice();
-  // Bonus relay: Cloudflare's speed-test TURN logins. Skipped silently if the browser blocks it.
-  try {
-    const ctrl = new AbortController(); setTimeout(() => ctrl.abort(), 3000);
-    const cf = await (await fetch('https://speed.cloudflare.com/turn-creds', { signal: ctrl.signal })).json();
-    if (cf && cf.urls) servers.push({ urls: cf.urls, username: cf.username, credential: cf.credential });
-  } catch (e) {}
-  peerOpts = { debug: 2, config: { iceServers: servers } };
-  return peerOpts;
-}
-if (typeof Peer === 'undefined') alert('peerjs.min.js did not load. Make sure it is in the same folder as index.html.');
 const show = id => ['home','waiting','viewer','share'].forEach(x => $(x).classList.toggle('hidden', x !== id));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const laneUrl = (code, k) => RELAY + PREFIX + code + '-' + k;
 
 function makeCode() {
   let c = '';
@@ -89,44 +77,45 @@ function makeCode() {
 }
 
 // ---------- Receiver (ViewSonic) ----------
-let viewPeer;
-async function startViewer() {
-  show('waiting');
+let lastStamp = 0, lastFrameAt = 0, shownUrl = null;
+
+function startViewer() {
   const code = makeCode();
-  viewPeer = new Peer(PREFIX + code, await getPeerOpts());
+  $('codeOut').textContent = code;
+  show('waiting');
+  for (let k = 0; k < LANES; k++) receiveLane(code, k);
 
-  viewPeer.on('open', () => {
-    $('codeOut').textContent = code;
-    $('viewStatus').textContent = 'Waiting for a screen...';
-  });
-
-  viewPeer.on('call', call => {
-    call.answer(); // receive only
-    $('viewStatus').textContent = 'Screen found, connecting...';
-    call.on('stream', stream => {
-      $('video').srcObject = stream;
-      $('video').play().catch(() => {});
-    });
-    const backToCode = msg => { $('video').srcObject = null; show('waiting'); $('viewStatus').textContent = msg || 'Waiting for a screen...'; };
-    call.on('close', () => backToCode());
-    call.on('error', () => backToCode());
-    const pc = call.peerConnection;
-    pc.addEventListener('connectionstatechange', () => {
-      const s = pc.connectionState;
-      if (s === 'connected') show('viewer'); // only switch once video can actually flow
-      if (s === 'failed') backToCode('Could not connect. The network blocks direct video; the free relay may be blocked too.');
-      if (s === 'disconnected' || s === 'closed') backToCode();
-    });
-  });
-
-  viewPeer.on('disconnected', () => viewPeer.reconnect());
-  viewPeer.on('error', err => {
-    if (err.type === 'unavailable-id') { viewPeer.destroy(); startViewer(); return; } // code taken, pick another
-    $('viewStatus').textContent = 'Error: ' + err.type + '. Reload the page.';
-  });
+  // Go back to the code screen if pictures stop for a while
+  setInterval(() => {
+    if (!$('viewer').classList.contains('hidden') && Date.now() - lastFrameAt > 8000) {
+      show('waiting');
+      $('viewStatus').textContent = 'Sharing stopped. Waiting for a screen...';
+    }
+  }, 2000);
 }
 
-// Tap video to go fullscreen
+async function receiveLane(code, k) {
+  while (true) {
+    try {
+      const res = await fetch(laneUrl(code, k), { cache: 'no-store' });
+      if (!res.ok) { await sleep(1000); continue; }
+      const buf = await res.arrayBuffer();
+      // First 16 bytes = when the picture was taken, so old pictures never replace newer ones
+      const stamp = Number(new TextDecoder().decode(buf.slice(0, 16)));
+      if (!(stamp > lastStamp)) continue;
+      lastStamp = stamp;
+      lastFrameAt = Date.now();
+      const url = URL.createObjectURL(new Blob([buf.slice(16)], { type: 'image/jpeg' }));
+      $('frame').src = url;
+      if (shownUrl) URL.revokeObjectURL(shownUrl);
+      shownUrl = url;
+      if ($('viewer').classList.contains('hidden')) show('viewer');
+    } catch (e) {
+      await sleep(1000); // network hiccup, try again
+    }
+  }
+}
+
 $('viewer').addEventListener('click', () => {
   if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(() => {});
   else document.exitFullscreen();
@@ -134,65 +123,78 @@ $('viewer').addEventListener('click', () => {
 document.addEventListener('fullscreenchange', () => $('fsHint').classList.toggle('hidden', !!document.fullscreenElement));
 
 // ---------- Sender (Surface) ----------
-let sendPeer, stream, call;
+let stream, sharing = false, aborter, sentCount = 0, statsTimer;
+const video = document.createElement('video');
+video.muted = true; video.playsInline = true;
+const canvas = document.createElement('canvas');
+const ctx = canvas.getContext('2d');
+
+function capture(maxW, q) {
+  const w = video.videoWidth, h = video.videoHeight;
+  if (!w) return Promise.resolve(null);
+  const scale = Math.min(1, maxW / w);
+  canvas.width = Math.round(w * scale);
+  canvas.height = Math.round(h * scale);
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  return new Promise(r => canvas.toBlob(r, 'image/jpeg', q));
+}
+
+async function sendLane(code, k, maxW, q) {
+  while (sharing) {
+    const jpg = await capture(maxW, q);
+    if (!jpg) { await sleep(100); continue; }
+    const stamp = String(Date.now() * 10 + k).padStart(16, '0');
+    try {
+      // Waits here until the ViewSonic picks this picture up
+      const res = await fetch(laneUrl(code, k), { method: 'POST', body: new Blob([stamp, jpg]), signal: aborter.signal });
+      if (res.ok) sentCount++;
+      else await sleep(500);
+    } catch (e) {
+      if (!sharing) return;
+      await sleep(1000);
+    }
+  }
+}
+
 async function startShare() {
   const code = $('codeIn').value.trim().toUpperCase();
   if (code.length !== 6) { $('shareStatus').textContent = 'Code must be 6 characters.'; return; }
+  const [maxW, q] = $('quality').value.split(',').map(Number);
 
   try {
-    stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: true });
+    stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 15 }, audio: false });
   } catch (e) {
     $('shareStatus').textContent = 'Screen share was cancelled.';
     return;
   }
-
-  const status = t => $('shareStatus').textContent = t;
-  status('Step 1/3: reaching matchmaking server...');
-  let stage = 1;
-  const timer = setTimeout(() => {
-    status(stage === 1
-      ? 'Stuck at step 1: this network blocks the matchmaking server (0.peerjs.com).'
-      : 'Stuck at step ' + stage + ': the devices found each other but the network blocks the direct video link. The free relay may be down or blocked too.');
-    stopShare(true);
-  }, 20000);
-
-  sendPeer = new Peer(await getPeerOpts());
-  sendPeer.on('open', () => {
-    stage = 2;
-    status('Step 2/3: calling the ViewSonic...');
-    call = sendPeer.call(PREFIX + code, stream);
-    if (!call) { clearTimeout(timer); status('Could not reach that screen.'); stopShare(true); return; }
-    const pc = call.peerConnection;
-    pc.addEventListener('iceconnectionstatechange', () => {
-      if (pc.iceConnectionState === 'checking') { stage = 3; status('Step 3/3: opening direct video link...'); }
-    });
-    pc.addEventListener('connectionstatechange', () => {
-      const s = pc.connectionState;
-      if (s === 'connected') { clearTimeout(timer); status('Sharing to ' + code); }
-      if (s === 'failed') { clearTimeout(timer); status('Direct link failed. The network blocks it; a TURN server is needed.'); stopShare(true); }
-    });
-    call.on('close', () => { clearTimeout(timer); stopShare(); });
-  });
-  sendPeer.on('error', err => {
-    clearTimeout(timer);
-    status(err.type === 'peer-unavailable' ? 'No screen found with that code. Check the code or reload the ViewSonic page.' : 'Error: ' + err.type);
-    stopShare(true);
-  });
-
-  // User clicked the browser's own "Stop sharing" bar
+  video.srcObject = stream;
+  await video.play();
   stream.getVideoTracks()[0].addEventListener('ended', stopShare);
+
+  sharing = true;
+  aborter = new AbortController();
+  sentCount = 0;
+  $('shareStatus').textContent = 'Waiting for the ViewSonic...';
+  for (let k = 0; k < LANES; k++) sendLane(code, k, maxW, q);
+
+  let prev = 0;
+  statsTimer = setInterval(() => {
+    const fps = (sentCount - prev) / 2; prev = sentCount;
+    $('shareStatus').textContent = sentCount ? 'Sharing to ' + code + ' (' + fps.toFixed(1) + ' pictures/sec)' : 'Waiting for the ViewSonic...';
+  }, 2000);
 
   $('startShare').classList.add('hidden');
   $('stopShare').classList.remove('hidden');
 }
 
-function stopShare(keepMsg) {
-  if (call) { call.close(); call = null; }
+function stopShare() {
+  sharing = false;
+  if (aborter) aborter.abort();
+  clearInterval(statsTimer);
   if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
-  if (sendPeer) { sendPeer.destroy(); sendPeer = null; }
   $('startShare').classList.remove('hidden');
   $('stopShare').classList.add('hidden');
-  if (keepMsg !== true) $('shareStatus').textContent = 'Stopped.';
+  $('shareStatus').textContent = 'Stopped.';
 }
 
 // ---------- Wiring ----------
@@ -202,7 +204,6 @@ $('startShare').onclick = startShare;
 $('stopShare').onclick = stopShare;
 $('codeIn').addEventListener('keydown', e => { if (e.key === 'Enter') startShare(); });
 
-// Bookmarkable: page.html#view on the ViewSonic, page.html#share on the Surface
 if (location.hash === '#view') startViewer();
 else if (location.hash === '#share') show('share');
 </script>
