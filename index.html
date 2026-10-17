@@ -34,7 +34,7 @@
 <div id="waiting" class="wrap hidden">
   <h1>Enter this code on the Surface</h1>
   <div class="code" id="codeOut">------</div>
-  <div class="status" id="viewStatus">Waiting for a screen...</div>
+  <div class="status" id="viewStatus">Connecting...</div>
 </div>
 
 <div id="viewer" class="hidden">
@@ -52,73 +52,73 @@
 </div>
 
 <script>
-// How it works: the Surface records its screen as compressed video and cuts it into
-// quarter-second pieces. Each piece goes through ppng.io (a free public relay, no account,
-// normal HTTPS) on one of several lanes at once. The ViewSonic puts the pieces back in
-// order and plays them, always jumping to the newest moment.
-const RELAY = 'https://ppng.io/';
-const PREFIX = 'jh-screencast-';
-const LANES = 4; // browsers allow only 6 open requests per site on older connections; stay under it
-const PIECE_MS = 400;
+// Your Cloudflare Worker (the /cast route)
+const RELAY = 'https://proctor-worker.jhxaybzc.workers.dev';
+
+// How it works: the Surface records its screen as compressed video and sends it in
+// fifth-of-a-second pieces over one WebSocket to your Cloudflare Worker, which passes
+// them straight to the ViewSonic. Everything runs over normal HTTPS (port 443).
+const relayBase = (new URLSearchParams(location.search).get('relay') || RELAY).replace(/\/$/, '').replace(/^http/, 'ws');
+const wsUrl = (code, role) => relayBase + '/cast?room=' + code + '&role=' + role;
+const PIECE_MS = 200;
 const MIME = ['video/webm;codecs=vp8', 'video/webm;codecs=vp9', 'video/webm']
   .find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || 'video/webm;codecs=vp8';
 const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const $ = id => document.getElementById(id);
 const show = id => ['home','waiting','viewer','share'].forEach(x => $(x).classList.toggle('hidden', x !== id));
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-const url = (code, name) => RELAY + PREFIX + code + '-' + name;
-const randomId = n => Array.from({ length: n }, () => ALPHABET[Math.floor(Math.random() * ALPHABET.length)]).join('');
+const randomCode = () => Array.from({ length: 6 }, () => ALPHABET[Math.floor(Math.random() * ALPHABET.length)]).join('');
 
 // =================== Receiver (ViewSonic) ===================
-const v = {
-  code: null, session: null, seen: new Set(), expected: 0, pending: new Map(),
-  ms: null, sb: null, queue: [], mime: 'video/webm;codecs=vp8', lastActivity: 0, lastAsk: 0,
-};
+const v = { code: null, ms: null, sb: null, queue: [], lastData: 0, ready: false };
 
 function startViewer() {
-  v.code = randomId(6);
+  v.code = randomCode();
   $('codeOut').textContent = v.code;
   show('waiting');
-  helloLoop();
-  for (let k = 0; k < LANES; k++) laneLoop(k);
+  connectViewer();
   setInterval(() => {
-    if (!$('viewer').classList.contains('hidden') && Date.now() - v.lastActivity > 8000) {
+    if (!$('viewer').classList.contains('hidden') && Date.now() - v.lastData > 6000) {
       show('waiting');
       $('viewStatus').textContent = 'Sharing stopped. Waiting for a screen...';
     }
   }, 2000);
 }
 
-// The Surface says hello at the start of every recording, so the player can start fresh
-async function helloLoop() {
-  while (true) {
-    try {
-      const res = await fetch(url(v.code, 'hello'), { cache: 'no-store' });
-      if (res.ok) {
-        const [session, mime] = (await res.text()).split('|');
-        resetPlayer(session, mime);
-        continue;
-      }
-    } catch (e) {}
-    await sleep(1000);
-  }
+function connectViewer() {
+  const ws = new WebSocket(wsUrl(v.code, 'viewer'));
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { $('viewStatus').textContent = 'Waiting for a screen...'; };
+  ws.onmessage = e => {
+    if (typeof e.data === 'string') {
+      const m = JSON.parse(e.data);
+      if (m.t === 'start') resetPlayer(m.mime);
+      return;
+    }
+    if (!v.ready) return; // wait for the start of a recording
+    v.queue.push(e.data);
+    pump();
+    v.lastData = Date.now();
+    if ($('viewer').classList.contains('hidden')) show('viewer');
+  };
+  ws.onclose = () => {
+    $('viewStatus').textContent = 'Reconnecting...';
+    setTimeout(connectViewer, 1500);
+  };
 }
 
-function resetPlayer(session, mime) {
-  v.session = session; v.seen.add(session);
-  v.expected = 0; v.pending.clear(); v.queue = [];
-  v.mime = mime || v.mime;
-  if (!window.MediaSource || !MediaSource.isTypeSupported(v.mime)) {
-    $('viewStatus').textContent = 'This browser cannot play the video (' + v.mime + ').';
+function resetPlayer(mime) {
+  v.queue = []; v.sb = null; v.ready = false;
+  if (!window.MediaSource || !MediaSource.isTypeSupported(mime)) {
+    $('viewStatus').textContent = 'This browser cannot play ' + mime;
     return;
   }
   const video = $('live');
-  v.ms = new MediaSource(); v.sb = null;
-  video.src = URL.createObjectURL(v.ms);
-  const ms = v.ms;
+  const ms = new MediaSource();
+  v.ms = ms; v.ready = true;
+  video.src = URL.createObjectURL(ms);
   ms.addEventListener('sourceopen', () => {
     if (ms !== v.ms) return;
-    v.sb = ms.addSourceBuffer(v.mime);
+    v.sb = ms.addSourceBuffer(mime);
     v.sb.addEventListener('updateend', onUpdateEnd);
     pump();
   }, { once: true });
@@ -127,8 +127,7 @@ function resetPlayer(session, mime) {
 function pump() {
   const sb = v.sb;
   if (!sb || sb.updating || !v.queue.length) return;
-  try { sb.appendBuffer(v.queue.shift()); }
-  catch (e) { askRestart(); }
+  try { sb.appendBuffer(v.queue.shift()); } catch (e) { v.queue = []; }
 }
 
 function onUpdateEnd() {
@@ -137,49 +136,11 @@ function onUpdateEnd() {
   const b = sb.buffered;
   if (b.length) {
     const end = b.end(b.length - 1);
-    if (end - video.currentTime > 1.2) video.currentTime = end - 0.2; // stay live
+    if (end - video.currentTime > 0.8) video.currentTime = end - 0.1; // stay live
     if (video.paused) video.play().catch(() => {});
     if (video.currentTime - b.start(0) > 20) { sb.remove(b.start(0), video.currentTime - 5); return; } // free memory
   }
   pump();
-}
-
-async function laneLoop(k) {
-  while (true) {
-    try {
-      const res = await fetch(url(v.code, k), { cache: 'no-store' });
-      if (!res.ok) { await sleep(500); continue; }
-      const buf = await res.arrayBuffer();
-      const head = new TextDecoder().decode(buf.slice(0, 16));
-      onPiece(head.slice(0, 8), Number(head.slice(8)), buf.slice(16));
-    } catch (e) {
-      await sleep(500);
-    }
-  }
-}
-
-function onPiece(session, seq, data) {
-  if (session !== v.session) {
-    if (!v.seen.has(session)) askRestart(); // joined mid-recording
-    return;
-  }
-  v.pending.set(seq, data);
-  while (v.pending.has(v.expected)) {
-    v.queue.push(v.pending.get(v.expected));
-    v.pending.delete(v.expected);
-    v.expected++;
-  }
-  if (v.pending.size > LANES * 3) askRestart(); // a piece went missing
-  pump();
-  v.lastActivity = Date.now();
-  if ($('viewer').classList.contains('hidden')) show('viewer');
-}
-
-// Ask the Surface to start a fresh recording
-function askRestart() {
-  if (Date.now() - v.lastAsk < 4000) return;
-  v.lastAsk = Date.now();
-  fetch(url(v.code, 'back'), { method: 'POST', body: 'restart', signal: AbortSignal.timeout(5000) }).catch(() => {});
 }
 
 $('viewer').addEventListener('click', () => {
@@ -189,73 +150,45 @@ $('viewer').addEventListener('click', () => {
 document.addEventListener('fullscreenchange', () => $('fsHint').classList.toggle('hidden', !!document.fullscreenElement));
 
 // =================== Sender (Surface) ===================
-const s = {
-  code: null, stream: null, sharing: false, aborter: null, recorder: null,
-  session: null, seq: 0, lanes: [], wake: [], sentBytes: 0, statsTimer: null,
-};
+const s = { code: null, stream: null, ws: null, rec: null, sharing: false, viewers: 0, sent: 0, timer: null };
 const status = t => $('shareStatus').textContent = t;
-const backlog = () => s.lanes.reduce((n, q) => n + q.length, 0);
-const wakeAll = () => s.wake.forEach(w => w && w());
 
-async function startSession() {
-  if (s.recorder) { s.recorder.ondataavailable = null; try { s.recorder.stop(); } catch (e) {} s.recorder = null; }
-  const session = randomId(8);
-  s.session = session; s.seq = 0;
-  s.lanes = Array.from({ length: LANES }, () => []);
-  wakeAll();
-  s.waiting = true;
-  status('Waiting for the ViewSonic...');
-
-  // Wait here until the ViewSonic is listening
-  while (s.sharing && s.session === session) {
-    try {
-      const res = await fetch(url(s.code, 'hello'), { method: 'POST', body: session + '|' + MIME, signal: s.aborter.signal });
-      if (res.ok) break;
-    } catch (e) {}
-    await sleep(1000);
-  }
-  if (!s.sharing || s.session !== session) return;
-  s.waiting = false;
-
-  const rec = new MediaRecorder(s.stream, { mimeType: MIME, videoBitsPerSecond: 2000000 });
-  rec.ondataavailable = e => {
-    if (!e.data.size || s.session !== session) return;
-    const seq = s.seq++;
-    const head = session + String(seq).padStart(8, '0');
-    s.lanes[seq % LANES].push(new Blob([head, e.data]));
-    const w = s.wake[seq % LANES]; if (w) w();
-    if (backlog() > 10) startSession(); // falling behind (over ~4 s): start fresh so it stays live
+function connectSender() {
+  const ws = new WebSocket(wsUrl(s.code, 'sender'));
+  s.ws = ws;
+  ws.onopen = () => status('Connected. Waiting for the ViewSonic...');
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.t === 'restart') startRecording();
+    if (m.t === 'viewers') { s.viewers = m.n; if (!m.n) stopRecording(); }
   };
-  s.recorder = rec;
+  ws.onclose = () => {
+    stopRecording();
+    if (s.sharing && s.ws === ws) { status('Reconnecting...'); setTimeout(connectSender, 1500); }
+  };
+}
+
+function stopRecording() {
+  if (!s.rec) return;
+  s.rec.ondataavailable = null;
+  try { s.rec.stop(); } catch (e) {}
+  s.rec = null;
+}
+
+function startRecording() {
+  stopRecording();
+  const ws = s.ws;
+  if (!s.sharing || !ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ t: 'start', mime: MIME }));
+  const rec = new MediaRecorder(s.stream, { mimeType: MIME, videoBitsPerSecond: 2500000 });
+  rec.ondataavailable = e => {
+    if (!e.data.size || ws.readyState !== WebSocket.OPEN) return;
+    if (ws.bufferedAmount > 2000000) { startRecording(); return; } // network falling behind: start fresh to stay live
+    ws.send(e.data);
+    s.sent += e.data.size;
+  };
+  s.rec = rec;
   rec.start(PIECE_MS);
-}
-
-async function sendLane(k) {
-  while (s.sharing) {
-    const q = s.lanes[k];
-    if (!q || !q.length) { await new Promise(r => { s.wake[k] = r; setTimeout(r, 1000); }); continue; }
-    const piece = q[0];
-    try {
-      const res = await fetch(url(s.code, k), { method: 'POST', body: piece, signal: s.aborter.signal });
-      if (res.ok) { if (q[0] === piece) q.shift(); s.sentBytes += piece.size; }
-      else await sleep(300);
-    } catch (e) {
-      if (!s.sharing) return;
-      await sleep(500);
-    }
-  }
-}
-
-async function listenBack() {
-  while (s.sharing) {
-    try {
-      const res = await fetch(url(s.code, 'back'), { cache: 'no-store', signal: s.aborter.signal });
-      if ((await res.text()) === 'restart') startSession();
-    } catch (e) {
-      if (!s.sharing) return;
-      await sleep(1000);
-    }
-  }
 }
 
 async function startShare() {
@@ -267,16 +200,14 @@ async function startShare() {
   } catch (e) { status('Screen share was cancelled.'); return; }
   s.stream.getVideoTracks()[0].addEventListener('ended', stopShare);
 
-  s.code = code; s.sharing = true; s.aborter = new AbortController(); s.sentBytes = 0;
-  for (let k = 0; k < LANES; k++) sendLane(k);
-  listenBack();
-  startSession();
+  s.code = code; s.sharing = true; s.sent = 0;
+  status('Connecting...');
+  connectSender();
 
   let prev = 0;
-  s.statsTimer = setInterval(() => {
-    const kbps = Math.round((s.sentBytes - prev) * 8 / 2000); prev = s.sentBytes;
-    if (s.waiting) status('Waiting for the ViewSonic...');
-    else status('Sharing to ' + code + ' (' + kbps + ' kbps, delay about ' + (0.5 + backlog() * PIECE_MS / 1000).toFixed(1) + ' s)');
+  s.timer = setInterval(() => {
+    const kbps = Math.round((s.sent - prev) * 8 / 2000); prev = s.sent;
+    if (s.rec) status('Sharing to ' + code + ' (' + kbps + ' kbps' + (s.ws.bufferedAmount > 300000 ? ', network is struggling' : '') + ')');
   }, 2000);
 
   $('startShare').classList.add('hidden');
@@ -285,11 +216,9 @@ async function startShare() {
 
 function stopShare() {
   s.sharing = false;
-  s.session = null;
-  if (s.recorder) { s.recorder.ondataavailable = null; try { s.recorder.stop(); } catch (e) {} s.recorder = null; }
-  if (s.aborter) s.aborter.abort();
-  wakeAll();
-  clearInterval(s.statsTimer);
+  stopRecording();
+  if (s.ws) { const ws = s.ws; s.ws = null; ws.close(); }
+  clearInterval(s.timer);
   if (s.stream) { s.stream.getTracks().forEach(t => t.stop()); s.stream = null; }
   $('startShare').classList.remove('hidden');
   $('stopShare').classList.add('hidden');
@@ -304,7 +233,7 @@ $('stopShare').onclick = stopShare;
 $('codeIn').addEventListener('keydown', e => { if (e.key === 'Enter') startShare(); });
 
 if (location.hash === '#view') startViewer();
-else if (location.hash === '#share') { show('share'); }
+else if (location.hash === '#share') show('share');
 </script>
 </body>
 </html>
